@@ -37,6 +37,13 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <log.h>
 #include <target.h>
 
+/* OpenSync */
+#include "util.h"
+#include "const.h"
+#include "log.h"
+#include "kconfig.h"
+#include "target.h"
+
 #define GENERATE_FILE_PATH(...) strfmta(__VA_ARGS__)
 #define HOSTAPD_CONF_FILE_PATH_NAME(vif) GENERATE_FILE_PATH("/var/run/hostapd-%s.config", vif)
 #define READ_FILE_DATA(...) file_geta(__VA_ARGS__)
@@ -45,10 +52,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define PASSPOINT_CONF_FILE_PATH_NAME(vif) GENERATE_FILE_PATH("%s/%s", CONFIG_PWM_PASSPOINT_CONFIG_DIR, vif)
 
 #define HOTSPOT_ENABLE "hs20"
-#define HOTSPOT_HESSID "hessid"
-#define HOTSPOT_DOMAIN_NAME "domain_name"
 #define HOTSPOT_WAN_METRICS "hs20_wan_metrics"
-#define HOTSPOT_ROAMING_CONSORTIUM "roaming_consortium"
 #define HOTSPOT_LIST_3GPP "anqp_3gpp_cell_net"
 #define HOTSPOT_NAIREALM "nai_realm"
 // statically configured mandatory hotspot values
@@ -86,17 +90,11 @@ target_passpoint_init()
 
 static char*
 get_value_from_config_file(const char *if_name, const char*passpoint_param_name,
-                                      bool is_hostapd_file, int max_params_count ) {
+                                      char *filename, int max_params_count ) {
 
-    char *filename = NULL;
     char *value = NULL;
     char *local_value = NULL;
 
-    if ( is_hostapd_file ) {
-        filename = HOSTAPD_CONF_FILE_PATH_NAME(if_name);
-    } else {
-        filename = PASSPOINT_CONF_FILE_PATH_NAME(if_name);
-    }
     if(filename) {
         LOGI("%s: File %s opened for reading parameter %s ", __func__, filename, passpoint_param_name);
         const char* data = READ_FILE_DATA(filename) ?: "";
@@ -157,39 +155,24 @@ get_value_from_config_file(const char *if_name, const char*passpoint_param_name,
 }
 
 static bool
-getset_value_ovsdb_table(const char *table_name, const char* matching_param, const char* matching_param_val,
-                             const char* param, char* value, bool set ) {
+get_value_ovsdb_table(const char *table_name, const char* matching_param, const char* matching_param_val,
+                             const char* param, char* value) {
 
     bool ret = false;
     FILE *fp;
     char cmd[PWM_STRING_SIZE] = {0};
     char data[PWM_STRING_SIZE] = {0};
 
-    if (set) {
-        sprintf(cmd,"ovsh u %s -w %s==%s  %s:='%s'",table_name, matching_param,
-            matching_param_val, param, value);
-        fp = popen(cmd, "r");
-        if (fp) {
-            if (fgets(data, sizeof(data), fp) != NULL ) {
-                if(strncmp(data, "1", strlen("1")) ==0) {
-                    ret =true;
-                    LOGI("%s: OVSDB table %s updated for %s==%s %s=%s ", __func__, table_name,
-                            matching_param, matching_param_val, param, value);
-                }
-            }
-        }
-    } else {
-        sprintf(cmd,"ovsh s %s -w %s==%s -c %s | awk '{split($0,a,\" \"); print a[3]}'",table_name, matching_param,
-            matching_param_val, param);
-        fp = popen(cmd, "r");
-        if (fp) {
-            while (fgets(data, sizeof(data), fp) != NULL ) {
-                if(strcmp(data, "\n") != 0) {
-                    strncpy(value, data, strlen(data));
-                    LOGI("%s: OVSDB table %s get for %s==%s %s=%s ", __func__, table_name,
-                            matching_param, matching_param_val, param, value);
-                    ret =true;
-                }
+    sprintf(cmd,"ovsh s %s -w %s==%s -c %s | awk '{split($0,a,\" \"); print a[3]}'",table_name, matching_param,
+        matching_param_val, param);
+    fp = popen(cmd, "r");
+    if (fp) {
+        while (fgets(data, sizeof(data), fp) != NULL ) {
+            if(strcmp(data, "\n") != 0) {
+                strncpy(value, data, strlen(data));
+                LOGI("%s: OVSDB table %s get for %s==%s %s=%s ", __func__, table_name,
+                        matching_param, matching_param_val, param, value);
+                ret =true;
             }
         }
     }
@@ -198,32 +181,44 @@ getset_value_ovsdb_table(const char *table_name, const char* matching_param, con
     return ret;
 }
 
-bool
-target_passpoint_configure(const struct schema_Passpoint_Config *conf, const char *if_name, bool state)
-{
-    bool ret = true;
-    const char* filename = PASSPOINT_CONF_FILE_PATH_NAME(if_name);
-    FILE *fptr;
+static bool
+set_value_ovsdb_table(const char *table_name, const char* matching_param, const char* matching_param_val,
+                             const char* param, char* value) {
 
-    target_passpoint_init();
+    bool ret = false;
+    FILE *fp;
+    char cmd[PWM_STRING_SIZE] = {0};
+    char data[PWM_STRING_SIZE] = {0};
 
-    LOGI("%s:  Entered", __func__);
-    fptr = fopen(filename,"w");
-
-    if(!fptr) {
-        LOGE("%s: Could not open file for configuring passpoint %s", __func__, filename);
-        return false;
+    sprintf(cmd,"ovsh u %s -w %s==%s  %s:='%s'",table_name, matching_param,
+        matching_param_val, param, value);
+    fp = popen(cmd, "r");
+    if (fp) {
+        if (fgets(data, sizeof(data), fp) != NULL ) {
+            if(strncmp(data, "1", strlen("1")) ==0) {
+                ret =true;
+                LOGI("%s: OVSDB table %s updated for %s==%s %s=%s ", __func__, table_name,
+                        matching_param, matching_param_val, param, value);
+            }
+        }
     }
 
-    // Set HOTSPOT_ENABLE
-    if( state )
+    pclose(fp);
+    return ret;
+}
+
+void set_hotspot_enable(FILE *fptr, bool state)
+{
+    if (state)
         fprintf(fptr,"%s=%d\n",HOTSPOT_ENABLE, 1);
     else
         fprintf(fptr,"%s=%d\n",HOTSPOT_ENABLE, 0);
 
     LOGI("%s: Set %s=%d", __func__, HOTSPOT_ENABLE, state);
+}
 
-    // Set HOTSPOT_WAN_METRICS
+void set_hotspot_wan_metrics(FILE *fptr, const struct schema_Passpoint_Config *conf)
+{
     if (conf->adv_wan_status_exists && conf->adv_wan_symmetric_exists && conf->adv_wan_at_capacity_exists) {
         // Parse and set adv_wan_status(B0-B1)adv_wan_symmetric(B2)adv_wan_at_capacity(B3) in hs20_wan_metrics
         int8_t wan_at = 0;
@@ -236,19 +231,26 @@ target_passpoint_configure(const struct schema_Passpoint_Config *conf, const cha
         fprintf(fptr, "%s=%02x:0:0:0:0:0\n",HOTSPOT_WAN_METRICS, wan_at | wan_sy | wan_st );
         LOGI("%s: Set %s=%02x:0:0:0:0:0", __func__, HOTSPOT_WAN_METRICS, wan_at | wan_sy | wan_st );
     }
+}
 
-    // Set HOTSPOT_HESSID
+void set_hotspot_hessid(FILE *fptr, const struct schema_Passpoint_Config *conf)
+{
     if (conf->hessid_exists) {
-        fprintf(fptr, "%s=%s\n",HOTSPOT_HESSID, conf->hessid);
-        LOGI("%s: Set %s=%s", __func__, HOTSPOT_HESSID, conf->hessid);
+        fprintf(fptr, "%s=%s\n", CONFIG_PWM_PASSPOINT_HESSID, conf->hessid);
+        LOGI("%s: Set %s=%s", __func__, CONFIG_PWM_PASSPOINT_HESSID, conf->hessid);
     }
+}
 
-    // Set HOTSPOT_DOMAIN_NAME
+void set_hotspot_domain_name(FILE *fptr, const struct schema_Passpoint_Config *conf)
+{
     if (conf->domain_name_exists) {
-        fprintf(fptr, "%s=%s\n", HOTSPOT_DOMAIN_NAME, conf->domain_name);
-        LOGI("%s: Set %s=%s", __func__, HOTSPOT_DOMAIN_NAME, conf->domain_name);
+        fprintf(fptr, "%s=%s\n", CONFIG_PWM_PASSPOINT_DOMAIN_NAME, conf->domain_name);
+        LOGI("%s: Set %s=%s", __func__, CONFIG_PWM_PASSPOINT_DOMAIN_NAME, conf->domain_name);
     }
-    // Set HOTSPOT_LIST_3GPP
+}
+
+void set_hotspot_list_3gpp(FILE *fptr, const struct schema_Passpoint_Config *conf)
+{
     if (conf->list_3gpp_len > 0) {
         // Parse and set list_3gpp (V1:V2,V3:V4) as (V1,V2;V3,V4)
         int ppt_i = 0;
@@ -279,8 +281,10 @@ target_passpoint_configure(const struct schema_Passpoint_Config *conf, const cha
             LOGI("%s: Set %s=%s", __func__, HOTSPOT_LIST_3GPP, anqp_final_val);
         }
     }
+}
 
-    // Set HOTSPOT_NAIREALM
+void set_hotspot_nairealm(FILE *fptr, const struct schema_Passpoint_Config *conf)
+{
     if (conf->nairealm_list_len > 0) {
         // Parse and set nairealm_list (V1,V2,V3) as (0,V1;V2;V3)
         int ppt_i = 0;
@@ -299,25 +303,31 @@ target_passpoint_configure(const struct schema_Passpoint_Config *conf, const cha
             LOGI("%s: Set %s=0,%s", __func__, HOTSPOT_NAIREALM, nairealm_val);
         }
     }
+}
 
-    // Set HOTSPOT_ROAMING_CONSORTIUM
+void set_hotspot_roaming_consortium(FILE *fptr, const struct schema_Passpoint_Config *conf)
+{
     if (conf->roaming_consortium_len > 0) {
         int ppt_i = 0;
         while ( (PASSPOINT_PARAM_ROAMING_CONSORTIUM_MAX_COUNT > ppt_i ) &&
                 conf->roaming_consortium[ppt_i][0] != '\0') {
-            fprintf(fptr, "%s=%s\n", HOTSPOT_ROAMING_CONSORTIUM, conf->roaming_consortium[ppt_i]);
-            LOGI("%s: Set %s=%s", __func__, HOTSPOT_ROAMING_CONSORTIUM, conf->roaming_consortium[ppt_i]);
+            fprintf(fptr, "%s=%s\n", CONFIG_PWM_PASSPOINT_ROAMING_CONSORTIUM, conf->roaming_consortium[ppt_i]);
+            LOGI("%s: Set %s=%s", __func__, CONFIG_PWM_PASSPOINT_ROAMING_CONSORTIUM, conf->roaming_consortium[ppt_i]);
             ppt_i++;
         }
     }
+}
 
-    // Set HOTSPOT_OTHER_CONFIG TODO, No configuration is coming for this from cloud
+void set_hotspot_other(FILE *fptr, const struct schema_Passpoint_Config *conf) {
     // So we don't know what to set here and in what format
     //if (conf->other_config_len > 0) {
         // Nothing TODO yet
     //}
+}
 
-    // Set Static Values not defined in schema, but mandatory for Hostapd to configure passpoint.
+// Set Static Values not defined in schema, but mandatory for Hostapd to configure passpoint.
+void set_hotspot_static(FILE *fptr)
+{
     // Enable Interworking service
     fprintf(fptr, "%s=%d\n",HOTSPOT_INTERWORKING, 1);
     LOGI("%s: Set %s=%d", __func__,HOTSPOT_INTERWORKING, 1);
@@ -350,6 +360,34 @@ target_passpoint_configure(const struct schema_Passpoint_Config *conf, const cha
      */
     fprintf(fptr, "%s=%d\n",HOTSPOT_ACCESS_NETWORK_TYPE, 15);
     LOGI("%s: Set %s=%d", __func__,HOTSPOT_ACCESS_NETWORK_TYPE, 15);
+}
+
+bool
+target_passpoint_configure(const struct schema_Passpoint_Config *conf, const char *if_name, bool state)
+{
+    bool ret = true;
+    const char* filename = PASSPOINT_CONF_FILE_PATH_NAME(if_name);
+    FILE *fptr;
+
+    target_passpoint_init();
+
+    LOGI("%s:  Entered", __func__);
+    fptr = fopen(filename,"w");
+
+    if(!fptr) {
+        LOGE("%s: Could not open file for configuring passpoint %s", __func__, filename);
+        return false;
+    }
+
+    set_hotspot_enable(fptr, state);
+    set_hotspot_wan_metrics(fptr, conf);
+    set_hotspot_hessid(fptr, conf);
+    set_hotspot_domain_name(fptr, conf);
+    set_hotspot_list_3gpp(fptr, conf);
+    set_hotspot_nairealm(fptr, conf);
+    set_hotspot_roaming_consortium(fptr, conf);
+    set_hotspot_other(fptr, conf); // TODO, No configuration is coming for this from cloud
+    set_hotspot_static(fptr);
 
     fclose(fptr);
 
@@ -428,70 +466,67 @@ target_passpoint_start(void)
     char *value = NULL;
     struct dirent *dir;
     char vif_state_value[PWM_STRING_SIZE] = {0};
-    bool to_recreate_vif = false;
 
     target_passpoint_init();
     LOGI("%s:  Entered", __func__);
     // get vif state for each interface
     d = opendir(CONFIG_PWM_PASSPOINT_CONFIG_DIR);
-    if (d) {
-        while ((dir = readdir(d)) != NULL) {
-            to_recreate_vif = false;
-            if( (strncmp(dir->d_name, ".", strlen(".")) == 0 ) || (strncmp(dir->d_name, "..", strlen("..")) == 0 ) )
-                continue;
-            if (getset_value_ovsdb_table("Wifi_VIF_State", "if_name", dir->d_name, "enabled", vif_state_value, false )  ) {
-                if(strncmp(vif_state_value, "true", strlen("true")) == 0) {
-                    // Get value of passpoint config file
-                    if( (value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
-                            false, PASSPOINT_PARAM_MAX_COUNT )) &&
-                            ((strncmp(value, "1",strlen("1"))) == 0) ) {
-                        // Get value of hostapd config file to recreate vif
-                        // if hs20 is not set enable
-                        if( (value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
-                                true, PASSPOINT_PARAM_MAX_COUNT )) &&
-                                !((strncmp(value, "1", strlen("1")) == 0))) {
-                            to_recreate_vif = true;
-                        } // if the hostapd config file is not present
-                        else if(! (value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
-                                true, PASSPOINT_PARAM_MAX_COUNT )) ) {
-                            to_recreate_vif = true;
-                        } else {
-                            // Passpoint Service already started for the Interface
-                            // as hs20 is already set enable
-                            LOGW("%s: Passpoint Service already started for Interface %s", __func__, dir->d_name);
-                        }
-                        if (to_recreate_vif) {
-                            //set enabled of Wifi_VIF_Config table to false then true in order for WM to apply the passpoint settings
-                            if ( getset_value_ovsdb_table("Wifi_VIF_Config", "if_name",
-                                    dir->d_name, "enabled", "false", true )) {
-                                if( !target_wait_on_Wifi_VIF_State_table_entry(dir->d_name, false)) {
-                                    LOGW("%s: Not able to set enabled = false for Interface %s , can't Restart", __func__, dir->d_name);
-                                    ret = false;
-                                } else {
-                                    if ( getset_value_ovsdb_table("Wifi_VIF_Config", "if_name",
-                                            dir->d_name, "enabled", "true", true )) {
-                                        if( !target_wait_on_Wifi_VIF_State_table_entry(dir->d_name, true)) {
-                                            LOGW("%s: Not able to set enabled = true for Interface %s , can't Restart", __func__, dir->d_name);
-                                            ret = false;
-                                        } else {
-                                            LOGI("%s: %s interface %s Restarted",
-                                                    __func__, "Wifi_VIF_Config", dir->d_name);
-                                        }
-                                    } else {
-                                        LOGW("%s: Not able to set enabled = true for Interface %s , can't Restart", __func__, dir->d_name);
-                                        ret = false;
-                                    }
-                                }
-                            } else {
-                                LOGW("%s: Not able to set enabled = false for Interface %s , can't Restart", __func__, dir->d_name);
-                                ret = false;
-                           }
-                        }
-                    }
-                }
-            }
-        }
+    if (!d) {
+        LOGW("%s: Unable to open Passpoint configuration directory %s", __func__, CONFIG_PWM_PASSPOINT_CONFIG_DIR);
+        goto close;
     }
+    while ((dir = readdir(d)) != NULL) {
+        if ( (strncmp(dir->d_name, ".", strlen(".")) == 0 ) || (strncmp(dir->d_name, "..", strlen("..")) == 0 ) ) {
+            LOGD("%s: Skipping directory '%s'", __func__, dir->d_name);
+            continue;
+        }
+        if (!get_value_ovsdb_table("Wifi_VIF_State", "if_name", dir->d_name, "enabled", vif_state_value)) {
+            LOGW("%s: Cannot get enabled state of VIF %s", __func__, dir->d_name);
+            continue;
+        }
+        if (strncmp(vif_state_value, "true", strlen("true")) != 0) {
+            LOGD("%s: Skipping disabled VIF %s", __func__, dir->d_name);
+            continue;
+        }
+        // Get value of Passpoint config file
+        if ( !(value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
+                PASSPOINT_CONF_FILE_PATH_NAME(dir->d_name), PASSPOINT_PARAM_MAX_COUNT )) ||
+                ((strncmp(value, "1", strlen("1"))) != 0) ) {
+            LOGD("%s: Passpoint config not enabled for VIF %s", __func__, dir->d_name);
+            continue;
+        }
+        // Skip to next VIF if config file is present and the hs20 is set enable.
+        if ( (value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
+                HOSTAPD_CONF_FILE_PATH_NAME(dir->d_name), PASSPOINT_PARAM_MAX_COUNT )) &&
+                ((strncmp(value, "1", strlen("1")) == 0)) ) {
+            LOGW("%s: Passpoint Service already started for Interface %s", __func__, dir->d_name);
+            continue;
+        }
+        //set enabled of Wifi_VIF_Config table to false then true in order for WM to apply the passpoint settings
+        if (!set_value_ovsdb_table("Wifi_VIF_Config", "if_name", dir->d_name, "enabled", "false" )) {
+            LOGW("%s: Not able to set enabled = false for Interface %s , can't Restart", __func__, dir->d_name);
+            ret = false;
+            continue;
+        }
+        if (!target_wait_on_Wifi_VIF_State_table_entry(dir->d_name, false)) {
+            LOGW("%s: Not able to set enabled = false for Interface %s , can't Restart", __func__, dir->d_name);
+            ret = false;
+            continue;
+        }
+        if (!set_value_ovsdb_table("Wifi_VIF_Config", "if_name", dir->d_name, "enabled", "true" )) {
+            LOGW("%s: Not able to set enabled = true for Interface %s , can't Restart", __func__, dir->d_name);
+            ret = false;
+            continue;
+        }
+        if (!target_wait_on_Wifi_VIF_State_table_entry(dir->d_name, true)) {
+            LOGW("%s: Not able to set enabled = true for Interface %s , can't Restart", __func__, dir->d_name);
+            ret = false;
+            continue;
+        }
+        LOGI("%s: %s interface %s Restarted", __func__, "Wifi_VIF_Config", dir->d_name);
+    }
+
+close:
     closedir(d);
 
     LOGI("%s:  Exited", __func__);
@@ -512,73 +547,73 @@ target_passpoint_stop(void)
     char vif_state_value[PWM_STRING_SIZE] = {0};
     char *value = NULL;
     struct dirent *dir;
-    bool to_recreate_vif = false;
 
     target_passpoint_init();
     LOGI("%s:  Entered", __func__);
 
     // get vif state for each interface
     d = opendir(CONFIG_PWM_PASSPOINT_CONFIG_DIR);
-    if (d) {
-        while ((dir = readdir(d)) != NULL) {
-            if( (strncmp(dir->d_name, ".", strlen(".")) == 0 ) || (strncmp(dir->d_name, "..", strlen("..")) == 0 ) )
-                continue;
-            LOGI("%s: Stopping Passpoint Service for vif if_name %s", __func__, dir->d_name);
-            if (getset_value_ovsdb_table("Wifi_VIF_State", "if_name", dir->d_name, "enabled", vif_state_value, false )  ) {
-                if(strncmp(vif_state_value, "true", strlen("true")) == 0) {
-                    // Get value of hostapd config file
-                    if( (value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
-                            true, PASSPOINT_PARAM_MAX_COUNT )) &&
-                            ((strncmp(value, "1",strlen("1"))) == 0) ) {
-                        // Get value of passpoint config file to recreate vif
-                        // if hs20 is not set enable
-                        if( (value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
-                                false, PASSPOINT_PARAM_MAX_COUNT )) &&
-                                !((strncmp(value, "1", strlen("1")) == 0))) {
-                            to_recreate_vif = true;
-                        } // if the passpoint config file is not present
-                        else if(! (value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
-                                false, PASSPOINT_PARAM_MAX_COUNT )) ) {
-                            to_recreate_vif = true;
-                        }
-                        if (to_recreate_vif) {
-                            //set enabled of Wifi_VIF_Config table to false then true in order for WM to apply the passpoint settings
-                            if ( getset_value_ovsdb_table("Wifi_VIF_Config", "if_name",
-                                    dir->d_name, "enabled", "false", true )) {
-                                if( !target_wait_on_Wifi_VIF_State_table_entry(dir->d_name, false)) {
-                                    LOGW("%s: Not able to set enabled = false for Interface %s , can't Restart", __func__, dir->d_name);
-                                    ret = false;
-                                } else {
-                                    if ( getset_value_ovsdb_table("Wifi_VIF_Config", "if_name",
-                                            dir->d_name, "enabled", "true", true )) {
-                                        if ( !target_wait_on_Wifi_VIF_State_table_entry(dir->d_name, true)) {
-                                            LOGW("%s: Not able to set enabled = false for Interface %s , can't Restart", __func__, dir->d_name);
-                                            ret = false;
-                                        } else {
-                                            LOGI("%s: %s interface %s Restarted and removed its passpoint config file = %s",
-                                                __func__, "Wifi_VIF_Config", dir->d_name, PASSPOINT_CONF_FILE_PATH_NAME(dir->d_name));
-                                            remove(PASSPOINT_CONF_FILE_PATH_NAME(dir->d_name));
-                                        }
-                                    } else {
-                                        LOGW("%s: Not able to set enabled = true for Interface %s , can't Restart", __func__, dir->d_name);
-                                        ret = false;
-                                    }
-                                }
-                            } else {
-                                LOGW("%s: Not able to set enabled = false for Interface %s , can't Recreate", __func__, dir->d_name);
-                                ret = false;
-                            }
-                        }
-                    } else {
-                        // Passpoint service already stopped for Interface
-                        // as hs20 is not set to enable in hostapd config
-                        LOGW("%s: Passpoint service already stopped for Interface %s", __func__, dir->d_name);
-                    }
-                }
-            }
+    if (!d) {
+        LOGW("%s: Unable to open Passpoint configuration directory %s", __func__, CONFIG_PWM_PASSPOINT_CONFIG_DIR);
+        goto close;
+    }
+    while ((dir = readdir(d)) != NULL) {
+        if( (strncmp(dir->d_name, ".", strlen(".")) == 0 ) || (strncmp(dir->d_name, "..", strlen("..")) == 0 ) ) {
+            LOGD("%s: Skipping directory '%s'", __func__, dir->d_name);
+            continue;
         }
+        LOGI("%s: Stopping Passpoint Service for vif if_name %s", __func__, dir->d_name);
+        if (!get_value_ovsdb_table("Wifi_VIF_State", "if_name", dir->d_name, "enabled", vif_state_value)) {
+            LOGW("%s: Cannot get enabled state of VIF %s", __func__, dir->d_name);
+            continue;
+        }
+        if(strncmp(vif_state_value, "true", strlen("true")) != 0) {
+            LOGD("%s: Skipping disabled VIF %s", __func__, dir->d_name);
+            continue;
+        }
+        // Get value of hostapd config file
+        if( !(value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
+                HOSTAPD_CONF_FILE_PATH_NAME(dir->d_name), PASSPOINT_PARAM_MAX_COUNT )) ||
+                ((strncmp(value, "1", strlen("1"))) != 0) ) {
+            // Passpoint service already stopped for Interface
+            // as hs20 is not set to enable in hostapd config
+            LOGW("%s: Passpoint service already stopped for Interface %s", __func__, dir->d_name);
+            continue;
+        }
+        // Get value of passpoint config file to recreate vif
+        // if hs20 is not set enable
+        if( (value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
+                PASSPOINT_CONF_FILE_PATH_NAME(dir->d_name), PASSPOINT_PARAM_MAX_COUNT )) &&
+                ((strncmp(value, "1", strlen("1")) == 0))) {
+            continue;
+        }
+        //set enabled of Wifi_VIF_Config table to false then true in order for WM to apply the passpoint settings
+        if (!set_value_ovsdb_table("Wifi_VIF_Config", "if_name", dir->d_name, "enabled", "false" )) {
+            LOGW("%s: Not able to set enabled = false for Interface %s , can't Recreate", __func__, dir->d_name);
+            ret = false;
+            continue;
+        }
+        if(!target_wait_on_Wifi_VIF_State_table_entry(dir->d_name, false)) {
+            LOGW("%s: Not able to set enabled = false for Interface %s , can't Restart", __func__, dir->d_name);
+            ret = false;
+            continue;
+        }
+        if (!set_value_ovsdb_table("Wifi_VIF_Config", "if_name", dir->d_name, "enabled", "true" )) {
+            LOGW("%s: Not able to set enabled = true for Interface %s , can't Restart", __func__, dir->d_name);
+            ret = false;
+            continue;
+        }
+        if (!target_wait_on_Wifi_VIF_State_table_entry(dir->d_name, true)) {
+            LOGW("%s: Not able to set enabled = false for Interface %s , can't Restart", __func__, dir->d_name);
+            ret = false;
+            continue;
+        }
+        LOGI("%s: %s interface %s Restarted and removed its passpoint config file = %s",
+            __func__, "Wifi_VIF_Config", dir->d_name, PASSPOINT_CONF_FILE_PATH_NAME(dir->d_name));
+        remove(PASSPOINT_CONF_FILE_PATH_NAME(dir->d_name));
     }
 
+close:
     closedir(d);
 
     LOGI("%s:  Exited", __func__);
@@ -593,26 +628,16 @@ char
 {
     char *value = NULL;
     char *local_value = NULL;
+    int max_params = PASSPOINT_PARAM_MAX_COUNT;
 
     target_passpoint_init();
     LOGI("%s:  Entered", __func__);
 
-    // Get HOTSPOT_HESSID
-    if( strcmp(name, CONFIG_PWM_PASSPOINT_HESSID) == 0 &&
-            ( local_value = get_value_from_config_file(if_name, HOTSPOT_HESSID,
-            true, PASSPOINT_PARAM_MAX_COUNT))) {
-        LOGI("%s: %s = %s", __func__, CONFIG_PWM_PASSPOINT_HESSID, local_value);
-    } // Get HOTSPOT_DOMAIN_NAME
-    else if( strcmp(name, CONFIG_PWM_PASSPOINT_DOMAIN_NAME) == 0 &&
-            ( local_value = get_value_from_config_file(if_name, HOTSPOT_DOMAIN_NAME,
-            true, PASSPOINT_PARAM_MAX_COUNT))) {
-        LOGI("%s: %s = %s", __func__, CONFIG_PWM_PASSPOINT_DOMAIN_NAME, local_value);
-    } // Get HOTSPOT_ROAMING_CONSORTIUM
-    else if( strcmp(name, CONFIG_PWM_PASSPOINT_ROAMING_CONSORTIUM) == 0 &&
-            ( local_value = get_value_from_config_file(if_name, HOTSPOT_ROAMING_CONSORTIUM,
-            true, PASSPOINT_PARAM_ROAMING_CONSORTIUM_MAX_COUNT))) {
-        LOGI("%s: %s = %s", __func__, CONFIG_PWM_PASSPOINT_ROAMING_CONSORTIUM, local_value);
-    }
+    if (strcmp(name, CONFIG_PWM_PASSPOINT_ROAMING_CONSORTIUM) == 0)
+        max_params = PASSPOINT_PARAM_ROAMING_CONSORTIUM_MAX_COUNT;
+
+    local_value = get_value_from_config_file(if_name, name, HOSTAPD_CONF_FILE_PATH_NAME(if_name), max_params);
+    LOGI("%s: %s = %s", __func__, name, local_value);
 
     if (local_value) {
         value = calloc(PWM_LONG_LONG_STRING_SIZE, sizeof(char));
@@ -652,7 +677,7 @@ target_passpoint_daemon_state(void)
 
             // Get value of hs20 from passpoint config file
             if((value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
-                    false, PASSPOINT_PARAM_MAX_COUNT ))) {
+                    PASSPOINT_CONF_FILE_PATH_NAME(dir->d_name), PASSPOINT_PARAM_MAX_COUNT ))) {
                 hs20_forall = hs20_forall & atoi(value);
                 LOGI("%s: For Interface name %s value of hs20 =  %s", __func__,dir->d_name, value);
             } else
@@ -691,7 +716,7 @@ target_passpoint_get_service_state(void)
             if( (strncmp(dir->d_name, ".", strlen(".")) == 0 ) || (strncmp(dir->d_name, "..", strlen("..")) == 0 ) )
                 continue;
 
-            if (getset_value_ovsdb_table("Wifi_VIF_State", "if_name", dir->d_name, "enabled", vif_state_value, false )  ) {
+            if (get_value_ovsdb_table("Wifi_VIF_State", "if_name", dir->d_name, "enabled", vif_state_value)  ) {
                 if(strncmp(vif_state_value, "true", strlen("true")) != 0)
                     hs20_forall = 0;
             } else
@@ -699,7 +724,7 @@ target_passpoint_get_service_state(void)
 
             // Get value of hs20 from hostapd config file
             if(hs20_forall && (value = get_value_from_config_file(dir->d_name, HOTSPOT_ENABLE,
-                    true, PASSPOINT_PARAM_MAX_COUNT ))) {
+                    HOSTAPD_CONF_FILE_PATH_NAME(dir->d_name), PASSPOINT_PARAM_MAX_COUNT ))) {
                 hs20_forall = hs20_forall & atoi(value);
                 LOGI("%s: For Interface name %s value of hs20 =  %s", __func__,dir->d_name, value);
             } else
