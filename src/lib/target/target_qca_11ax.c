@@ -1468,7 +1468,7 @@ qca_ctrl_discover(const char *bss)
         ctrl_enable(&hapd->ctrl);
         caps = strchomp(R(F("/sys/class/net/%s/cfg80211_htcaps", bss)), "\r\n ");
         if (caps != NULL) STRSCPY_WARN(hapd->htcaps, caps);
-        STRSCAT(hapd->htcaps, "[SHORT-GI]");
+        if (!strstr(bss, SCHEMA_CONSTS_IF_NAME_POSTFIX_6G)) STRSCAT(hapd->htcaps, "[SHORT-GI]");
         caps = strchomp(R(F("/sys/class/net/%s/cfg80211_vhtcaps", bss)), "\r\n ");
         if (caps != NULL) STRSCPY_WARN(hapd->vhtcaps, caps);
         hapd = NULL;
@@ -2187,6 +2187,44 @@ int target_bsal_send_action(const char *ifname, const uint8_t *mac_addr,
     return qca_bsal_send_action(ifname, mac_addr, data, data_len);
 }
 
+// CS ADD - START - Gracefully unload NSS GRE, if loaded
+static void
+util_gre_stop(const char* vif)
+{
+    json_t *where = NULL;
+    json_t *jrows = NULL;
+    json_t *jobj = NULL;
+    struct schema_Wifi_Inet_Config iconf;
+    pjs_errmsg_t perr = {0};
+    char cmdline[256] = {0};
+    size_t idx=0;
+
+    if (access("/proc/gre", W_OK))
+    {
+        return; // Nothing to do. NSS GRE is not enabled
+    }
+
+    where = ovsdb_where_simple(SCHEMA_COLUMN(Wifi_Inet_Config, gre_ifname), vif);
+    jrows = ovsdb_sync_select_where(SCHEMA_TABLE(Wifi_Inet_Config), where);
+    for (idx = 0; idx < json_array_size(jrows); idx++)
+    {
+        jobj = json_array_get(jrows, idx);
+        if (schema_Wifi_Inet_Config_from_json(&iconf, jobj, false, perr))
+        {
+            if (!strcmp("gre", iconf.if_type)) {
+                snprintf(cmdline, sizeof(cmdline), "echo dev=%s > /proc/gre", iconf.if_name);
+                LOGI("%s: executing %s", __func__, cmdline);
+                if (!cmd_log(cmdline))
+                {
+                    LOGE("delete nss gre failed: %s", cmdline);
+                }
+            }
+        }
+    }
+    json_decref(where);
+    json_decref(jrows);
+} // CS ADD - END
+
 /******************************************************************************
  * CSA
  *****************************************************************************/
@@ -2418,6 +2456,7 @@ util_csa_completion_check_vif(const char *vif)
     util_cb_delayed_update(UTIL_CB_PHY, phy);
 }
 
+#if 0 // fix switching channel fail from dfs channel to none-dfs channel, unused function
 static int
 util_cac_in_progress(const char *phy)
 {
@@ -2437,6 +2476,7 @@ util_cac_in_progress(const char *phy)
 
     return 0;
 }
+#endif
 
 static int
 util_csa_start(const char *phy,
@@ -2446,9 +2486,9 @@ util_csa_start(const char *phy,
                const char *ht_mode,
                int channel)
 {
-    char mode[32];
     int err;
-
+#if 0 // fix switching channel fail from dfs channel to none-dfs channel
+    char mode[32];
     if (util_cac_in_progress(phy)) {
         LOGI("%s: cac in progress, switching channel through down/up", phy);
         memset(mode, 0, sizeof(mode));
@@ -2460,7 +2500,14 @@ util_csa_start(const char *phy,
         err |= WARN_ON(!strexa("ifconfig", vif, "up"));
         return err ? -1 : 0;
     }
+#endif
 
+    err = runcmd("cfg80211tool.1 -i %s -f %s -h none --START_CMD --channel --value0 %d --value1 %d --RESPONSE --channel --END_CMD",
+                 vif,
+                 qca_get_xml_path(vif),
+                 channel,
+                 util_get_radio_band(freq_band));
+#if 0
     err = runcmd("exttool --chanswitch --interface %s --chan %d --band %d --numcsa %d --chwidth %d --secoffset %d",
                  phy,
                  channel,
@@ -2468,6 +2515,7 @@ util_csa_start(const char *phy,
                  CSA_COUNT,
                  util_csa_get_chwidth(phy, ht_mode),
                  util_csa_get_secoffset(phy, channel));
+#endif
     if (err) {
         LOGW("%s: failed to run exttool; is csa already running? invalid channel? nop active?",
              phy);
@@ -2960,7 +3008,7 @@ util_policy_get_min_hw_mode(const char *vif)
     if (!strcmp(vif, "home-ap-24"))
         return "11b";
     else
-        return "11g"; /* works for both 2.4GHz and 5GHz */
+        return "11a"; // CS MOD - from 11g /* works for both 2.4GHz and 5GHz */
 }
 
 /******************************************************************************
@@ -3275,6 +3323,7 @@ util_radio_ht_mode_get(char *phy, char *htmode, int htmode_len)
     }
     if (strlen(htmode) == 0) {
         if (util_radio_ht_mode_get_max(phy, ht_mode_vif, sizeof(ht_mode_vif))) {
+            if (!strcmp(ht_mode_vif, "160")) { snprintf(ht_mode_vif, sizeof(ht_mode_vif), "80"); } // CS ADD - Limit default to 80
             snprintf(htmode, htmode_len, "HT%s", ht_mode_vif);
             return true;
         }
@@ -3494,6 +3543,9 @@ bool target_radio_state_get(char *phy, struct schema_Wifi_Radio_State *rstate)
     type = util_thermal_get_qca_names(phy);
     if ((rstate->tx_chainmask_exists = util_qca_get_int(phy, type[0], &v) && v > 0))
         rstate->tx_chainmask = v;
+    // CS ADD - Oneline - workaround - tx_chainmask may get downgraded (likely due to thermal).
+    // This causes Config != State (i.e. lots of WM logs trying to fix it every 30 seconds).
+    if (!strcmp(phy, "wifi1")) { rstate->tx_chainmask = 15; }
 
     t = util_thermal_lookup(phy);
 
@@ -4072,7 +4124,9 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
     int o;
     int err;
     char buf[128];
+    const struct kvstore *kv;
     const char *xml_path = qca_get_xml_path(phy);
+    const char *vif_xml_path = qca_get_xml_path(vif);
 
     if (!rconf ||
         changed->enabled ||
@@ -4081,6 +4135,7 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
         qca_ctrl_destroy(vif);
 
         if (access(F("/sys/class/net/%s", vif), X_OK) == 0) {
+            util_gre_stop(vif); // CS ADD - wlanconfig <vif> destroy hangs if tied to nss gre
             LOGI("%s: deleting netdev", vif);
             wlanconfig_nl80211_delete_intreface(vif);
             util_vif_config_athnewind(phy);
@@ -4149,7 +4204,16 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
                                  "get_cwmenable",
                                  "cwmenable",
                                  util_policy_get_cwm_enable(phy));
-        if (util_iwconfig_any_phy_vif_type(phy, "sta", A(32)) == NULL) {
+
+        /* Charter SCPBLFW-8808 : because 5g does not support disable coex = false
+         * and for qca pure openwrt, the 5g default is 1.
+         * so skip the following disablecoex setting of 5G
+         */
+        if ( !strstr(vif, "-50") ) {
+
+#ifndef CONFIG_DISABLE_COEXT_STA_IFACE
+        if (util_iwconfig_any_phy_vif_type(phy, "sta", A(32)) == NULL)
+#endif
             util_qca_set_int_lazy(vif,
                                  "g_disablecoext",
                                  "disablecoext",
@@ -4235,6 +4299,93 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
     if (changed->mcast2ucast)
         util_qca_set_int_lazy(vif, "g_mcastenhance", "mcastenhance", D(vconf->mcast2ucast, 0) ? 5 : 0);
 
+if (vconf->max_sta_exists) {
+        util_qca_set_int_lazy(vif, "get_maxsta", "maxsta", D(vconf->max_sta, 0));
+        LOGI("Setting vconf->max_sta =%d",vconf->max_sta);
+    }
+
+    if (vconf->min_rssi_exists) {
+        util_qca_set_int_lazy(vif, "g_oce", "oce", 1);
+        util_qca_set_int_lazy(vif, "g_oce_asoc_rej", "oce_asoc_rej", 1);
+        util_qca_set_int_lazy(vif, "g_oce_asoc_rssi", "oce_asoc_rssi", D(vconf->min_rssi, 0));
+        util_qca_set_int_lazy(vif, "g_oce_asoc_dly", "oce_asoc_dly", 30);
+        LOGI("Setting vconf->min_rssi =%d",vconf->min_rssi);
+    }
+
+    // Delete the previous ATF rule when SSID is changed.
+    if (changed->ssid) {
+        // Need check current SSID and previous is same or not, If it is different, it need delete previous SSID aitrtime setting.. 
+        kv = util_kv_get(F("%s.last_ssid", vif));
+        if (kv && strcmp(vconf->ssid, kv->val)) {
+            LOGI("%s: Deleting previous SSID: %s airtime setting.",vif, kv->val);
+            WARN_ON(!strexa("wlanconfig", vif, "delssid", kv->val));
+        }
+        LOGI("%s: Insert current SSID = %s",vif, vconf->ssid);
+        util_kv_set(F("%s.last_ssid", vif), vconf->ssid);
+    }
+
+    /*
+       1. commitatf description: Refer to the 80-ya728-5_yyc_wireless_lan_access_point_(driver_version_11.0)_command_reference.pdf - Page.250
+       2. Also need to check the qca-wifi wlanconfig ATF code, 
+          path: qca-wifi-xxx-dirty/os/linux/tools/wlanconfig.c
+            #if QCA_AIRTIME_FAIRNESS
+               else if (strncmp(ifname,"ath",3) == 0) {  <- this "ath" need change to the "home-ap-" and "haahs-ap-"
+       In OpenSync platform, the VAP ifname isn't "ath" prefix.
+       Following the 770-qca_wifi_wlanconfig_ifname_changed.patch
+    */
+    if (changed->airtime_precedence)
+    {
+        // Setting the ATF parameter need commitatf 0 first.
+        WARN_ON(!strexa("wlanconfig", vif, "commitatf", "0"));
+
+        if (vconf->airtime_precedence_exists)
+        {
+	            if (strstr(vif, "home-ap-"))
+                WARN_ON(!strexa("wlanconfig", vif, "addssid", vconf->ssid, "100"));
+            if (strstr(vif, "haahs-ap-"))
+                WARN_ON(!strexa("wlanconfig", vif, "addssid", vconf->ssid, "0"));
+            util_kv_set(F("%s.airtime_precedence", vif), vconf->airtime_precedence);
+        } else {
+            WARN_ON(!strexa("wlanconfig", vif, "delssid", vconf->ssid));
+	    util_kv_set(F("%s.airtime_precedence", vif), "");
+	}
+        // Setting finish the ATF parameter need commitatf 1.
+        WARN_ON(!strexa("wlanconfig", vif, "commitatf", "1"));
+    }
+    // CS ADD - START - Add support for maxsta, min_rssi, and airtime_precedence
+    if (vconf->max_sta_exists) {
+        util_qca_set_int_lazy(vif, "get_maxsta", "maxsta", D(vconf->max_sta, 513));
+        LOGD("Setting max_sta=%d (Valid range is 1 to 513)", D(vconf->max_sta, 513));
+    }
+
+    if (vconf->min_rssi_exists) {
+        util_qca_set_int_lazy(vif, "g_oce", "oce", 1);
+        util_qca_set_int_lazy(vif, "g_oce_asoc_rej", "oce_asoc_rej", 1);
+        util_qca_set_int_lazy(vif, "g_oce_asoc_rssi", "oce_asoc_rssi", D(vconf->min_rssi, -90));
+        util_qca_set_int_lazy(vif, "g_oce_asoc_dly", "oce_asoc_dly", 30);
+        LOGD("Setting min_rssi=%d (Valid range is -90 to -30)", D(vconf->min_rssi, -90));
+    }
+
+    if (vconf->airtime_precedence_exists) {
+        const char* atf_percent="75";
+        if (!strcasecmp(vconf->airtime_precedence, "high")) {
+            atf_percent="75";
+        }
+        else if (!strcasecmp(vconf->airtime_precedence, "medium")) {
+            atf_percent="50";
+        }
+        else if (!strcasecmp(vconf->airtime_precedence, "low")) {
+            atf_percent="25";
+        }
+        WARN_ON(!strexa("wlanconfig", vif, "addssid", vconf->ssid, atf_percent, "-cfg80211"));
+        LOGI("Set %s %s airtime_precedence to %s (%s)",vif, vconf->ssid, atf_percent, vconf->airtime_precedence);
+        // Add support for when atf is disabled:
+        if (!util_qca_get_int(vif, "get_commitatf", &v) || v == 0)
+        {
+            file_put(strfmta("/var/run/.atf_precedence-%s", vif), atf_percent);
+        }
+    } // CS ADD - END
+
     if (changed->ap_bridge)
         util_qca_set_int_lazy(vif, "get_ap_bridge", "ap_bridge", D(vconf->ap_bridge, 0));
 
@@ -4269,6 +4420,9 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
         if (changed->min_hw_mode)
             util_vif_min_hw_mode_set(vif, vconf->min_hw_mode);
 
+    if (!strcmp(rconf->freq_band, SCHEMA_CONSTS_RADIO_TYPE_STR_6G))
+        util_qca_set_int_lazy(vif, "g_en_6g_sec_comp", "en_6g_sec_comp", 0);
+
     qca_ctrl_apply(vif, vconf, rconf, cconfs, num_cconfs);
     if (changed->wps_pbc || changed->wps || changed->wps_pbc_key_id) {
         qca_ctrl_wps_session(vif, vconf->wps, vconf->wps_pbc);
@@ -4282,6 +4436,40 @@ done:
     return true;
 }
 
+// CS ADD - START
+static bool util_qca_get_airtime(const char *ifname, const char *ssid, int *v)
+{
+    char line[512] = {0};
+    char cmd[256] = {0};
+    char match[256] = {0};
+    FILE *fp = NULL;
+    bool retval = false;
+
+    snprintf(cmd, sizeof(cmd), "wlanconfig %s showatftable", ifname);
+    snprintf(match, sizeof(match), "%s %%*s %%d", ssid);
+    LOGI("Executed command = %s", cmd);
+    if (NULL != (fp = popen(cmd, "r")))
+    {
+        while (fgets(line, sizeof(line), fp))
+        {
+            if (1 == sscanf(line, match, v))
+            {
+                retval = true;
+                LOGD("airtime match: %s", line);
+                break;
+            }
+        }
+        pclose(fp);
+    }
+    // Add support for when atf is disabled:
+    if (!retval && util_qca_get_int(ifname, "get_commitatf", v) && *v == 0)
+    {
+        *v = atoi(file_geta(strfmta("/var/run/.atf_precedence-%s", ifname)) ?: "-1");
+        retval = (*v >= 0);
+    }
+    return retval;
+} // CS ADD - END
+
 bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
 {
     struct hapd *hapd = hapd_lookup(vif);
@@ -4293,6 +4481,13 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
     char *p;
     int err;
     int v;
+    char atf_ssid_buf[128];
+    char atf_table_buf[512];
+    char *token = NULL;
+    char *parsed_atf_str = NULL;
+    int atf_i = 0;
+    int atf_percent = 0;
+    const struct kvstore *kv;
 
     memset(vstate, 0, sizeof(*vstate));
 
@@ -4381,8 +4576,75 @@ bool target_vif_state_get(char *vif, struct schema_Wifi_VIF_State *vstate)
         if ((vstate->min_hw_mode_exists = (r = util_vif_min_hw_mode_get(vif))))
             STRSCPY(vstate->min_hw_mode, r);
 
+    if ((vstate->max_sta_exists = util_qca_get_int(vif, "get_maxsta", &v)))
+        vstate->max_sta = v;
+
+    if ((vstate->min_rssi_exists = util_qca_get_int(vif, "g_oce_asoc_rssi", &v)))
+        vstate->min_rssi = v;
+
+    err = readcmd(atf_ssid_buf, sizeof(atf_ssid_buf), rtrimnl, "tmp_var2=`iwconfig %s | grep %s | awk '{split($0,a,\"\\\"\"); print a[2]}'` && echo $tmp_var2 2>&1", vif, vif);
+    if (err) {
+        LOGW("%s: Fetch the VAP SSID failed: %d (%s)", vif, errno, strerror(errno));
+        goto atf_precedence_skip;
+    }
+
+    err = readcmd(atf_table_buf, sizeof(atf_table_buf), 0, "tmp_var1=`wlanconfig %s showatftable 2>&1` && echo $tmp_var1 2>&1", vif);
+    if (err) {
+        LOGW("%s: Show ATF table failed on VAP: %d (%s)", vif, errno, strerror(errno));
+        goto atf_precedence_skip;
+    }
+
+    parsed_atf_str = strstr(atf_table_buf, atf_ssid_buf);
+
+     if (parsed_atf_str == NULL) {
+        // Use flushatftable command, otherwise the ATF table can't release the old SSID airtime percentage.
+        WARN_ON(!strexa("wlanconfig", vif, "flushatftable")); 
+
+
+    if (parsed_atf_str == NULL)
+        goto atf_precedence_skip;
+
+    token = strtok(parsed_atf_str, " ");
+
+    while (token != NULL) {
+        token = strtok(NULL, " ");
+        atf_i++;
+        if (atf_i == 2) { // Config ATF(Percentage)
+            atf_percent = atoi(token);
+            break;
+        }
+    }
+    LOGI("atf_percent = %d", atf_percent);
+    kv = util_kv_get(F("%s.airtime_precedence", vif));
+    if (kv) {
+        vstate->airtime_precedence_exists = true;
+        strcpy(vstate->airtime_precedence, kv->val);
+    }
+
+    LOGI("vstate->airtime_precedence = %s, ignore the NOC configuration.", vstate->airtime_precedence);
+    atf_precedence_skip:
+
     if (hapd) hapd_bss_get(hapd, vstate);
     if (wpas) wpas_bss_get(wpas, vstate);
+
+    // CS ADD - START - Add support for maxsta, min_rssi, and airtime_precedence
+    if ((vstate->max_sta_exists = util_qca_get_int(vif, "get_maxsta", &v))) {
+        vstate->max_sta = v;
+        vstate->max_sta_exists = !(v == 513); // clear result if set to default.
+    }
+
+    if ((vstate->min_rssi_exists = util_qca_get_int(vif, "g_oce_asoc_rssi", &v))) {
+        vstate->min_rssi = v;
+        vstate->min_rssi_exists = (!util_qca_get_int(vif, "g_oce", &v) || v!=0); // clear result if disabled
+    }
+
+    if (vstate->ssid_exists && (vstate->airtime_precedence_exists = util_qca_get_airtime(vif, vstate->ssid, &v))) {
+        const char* precedence = "high";
+        if (v <= 50) { precedence = "medium"; }
+        if (v <= 25) { precedence = "low"; }
+        strcpy(vstate->airtime_precedence, precedence);
+    }
+    // CS ADD - END
 
     return true;
 }
