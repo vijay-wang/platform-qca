@@ -4128,6 +4128,7 @@ target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
     const char *xml_path = qca_get_xml_path(phy);
     const char *vif_xml_path = qca_get_xml_path(vif);
 
+	LOGE("[RAJA]>>target_vif_config_set2");
     if (!rconf ||
         changed->enabled ||
         changed->mode ||
