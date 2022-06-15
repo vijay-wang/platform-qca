@@ -55,10 +55,10 @@ collect_qcawl()
     do
         # txrx_fw_stats iwpriv is reachable via vap netdevs, not radio netdevs even though stats are radio-wise
         ifname=$(find /sys -name parent \
-            | xargs grep -H $radio \
+            | xargs -r grep -H $radio \
             | sed 1q \
-            | xargs -n1 dirname \
-            | xargs -n1 basename)
+            | xargs -rn1 dirname \
+            | xargs -rn1 basename)
         # FIXME: wave2 hw / 10.4 supports more, e.g. for fetch requests/peer flow control
         for arg in 1 2 3 5 6 7 8; do
             # There's no guarantee that requests stats will be available in
